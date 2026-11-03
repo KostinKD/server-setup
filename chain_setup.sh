@@ -94,3 +94,145 @@ services:
       - PEERS=${peer}
       - PEERDNS=1.1.1.1
       - INTERNAL_SUBNET=${subnet}
+      - ALLOWEDIPS=0.0.0.0/0
+      - IP6_SUBNET=off
+      - AWG_VERSION=2.0
+      - LOG_CONFS=false
+      - PERSISTENTKEEPALIVE_PEERS=all
+    volumes:
+      - ./config:/config
+    ports:
+      - '${port}:${port}/udp'
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: unless-stopped
+EOF
+ echo "$location" > "$BASE/role"
+ chmod 600 "$BASE/docker-compose.yml" "$BASE/role"
+ cd "$BASE"
+ docker compose config -q
+ docker compose up -d
+}
+wait_file(){
+ local file="$1"
+ for _ in $(seq 1 40); do [[ -s "$file" ]] && return 0; sleep 2; done
+ docker logs --tail 80 amneziawg || true
+ die "Did not generate $file; inspect Docker logs."
+}
+status(){
+ [[ -f "$BASE/docker-compose.yml" ]] || die "No installation at $BASE"
+ cd "$BASE"
+ docker compose ps
+ docker exec amneziawg awg show || true
+ if [[ -f "$BASE/role" && $(cat "$BASE/role") == msk ]]; then
+   docker exec amneziawg ip -4 rule show || true
+   docker exec amneziawg ip -4 route show table "$TABLE" || true
+   docker exec amneziawg iptables -S FORWARD || true
+ fi
+}
+case "$mode" in
+ sweden|msk-init)
+   [[ -n "$PUBLIC_IP" ]] || die 'Provide --public-ip'
+   command -v python3 >/dev/null || { apt-get update; apt-get install -y python3; }
+   validate_ip "$PUBLIC_IP"
+   require_host
+   [[ ! -e "$BASE/role" ]] || die "Installation already exists at $BASE; refusing to overwrite keys."
+   install_docker
+   if [[ "$mode" == sweden ]]; then
+     log 'Configuring Sweden exit: UDP 51821'
+     write_compose sweden "$PUBLIC_IP" "$SE_PORT" "$SE_SUBNET" msk Europe/Stockholm
+     wait_file "$BASE/config/peer_msk/peer_msk.conf"
+     log "Ready: copy $BASE/config/peer_msk/peer_msk.conf securely to MSK."
+   else
+     log 'Configuring Moscow entry: UDP 51820'
+     write_compose msk "$PUBLIC_IP" "$MSK_PORT" "$MSK_SUBNET" keenetic Europe/Moscow
+     wait_file "$BASE/config/peer_keenetic/peer_keenetic.conf"
+     log "Ready: Keenetic config at $BASE/config/peer_keenetic/peer_keenetic.conf"
+     log 'Next: msk-finish --upstream /path/to/peer_msk.conf'
+   fi
+   status
+   ;;
+ msk-finish)
+   [[ -f "$BASE/role" && $(cat "$BASE/role") == msk ]] || die 'Run msk-init first, on MSK VPS.'
+   [[ -n "$UPSTREAM" && -r "$UPSTREAM" ]] || die 'Provide a readable --upstream peer_msk.conf from Sweden.'
+   [[ ! -e "$BASE/cascade-installed" ]] || die 'Cascade already installed; refusing to overwrite configurations.'
+   [[ -f "$BASE/config/wg_confs/wg0.conf" ]] || die 'Generated wg0.conf missing.'
+   command -v python3 >/dev/null || die 'python3 required.'
+   log 'Stopping MSK container to modify generated config'
+   cd "$BASE"; docker compose down
+   mkdir -p "$BASE/backup"
+   cp -a "$BASE/config/wg_confs/wg0.conf" "$BASE/backup/wg0.before-cascade.conf"
+   cp "$UPSTREAM" "$BASE/config/wg_confs/wg1.conf"
+   chmod 600 "$BASE/config/wg_confs/wg1.conf"
+   cat > "$BASE/config/hub-rules.sh" <<'EOF'
+#!/bin/sh
+set -eu
+# Runs inside container namespace, invoked by wg0 on start/stop.
+mode="${1:?up|down}"
+TABLE=55111
+CIDR=10.70.0.0/24
+# Idempotently remove our own rules (avoid clobbering Docker host firewall).
+remove() {
+  iptables -t nat -D POSTROUTING -s "$CIDR" -o wg1 -j MASQUERADE 2>/dev/null || true
+  iptables -D FORWARD -i wg1 -o wg0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i wg0 ! -o wg1 -j DROP 2>/dev/null || true
+  ip rule del pref 1000 from "$CIDR" table "$TABLE" 2>/dev/null || true
+  ip route del unreachable default table "$TABLE" metric 4278198272 2>/dev/null || true
+}
+case "$mode" in
+ up)
+  remove
+  # Install the blackhole route before the policy rule. Linux will not fall
+  # through to main table when wg1 is missing.
+  ip route add unreachable default table "$TABLE" metric 4278198272
+  ip rule add pref 1000 from "$CIDR" table "$TABLE"
+  iptables -I FORWARD 1 -i wg0 ! -o wg1 -j DROP
+  iptables -I FORWARD 1 -i wg0 -o wg1 -j ACCEPT
+  iptables -I FORWARD 1 -i wg1 -o wg0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -t nat -I POSTROUTING 1 -s "$CIDR" -o wg1 -j MASQUERADE
+  ;;
+ down) remove ;;
+ *) echo 'Expected up or down' >&2; exit 2;;
+esac
+EOF
+   chmod 700 "$BASE/config/hub-rules.sh"
+   python3 - "$BASE/config/wg_confs/wg0.conf" "$BASE/config/wg_confs/wg1.conf" <<'PY'
+import pathlib, re, sys
+server=pathlib.Path(sys.argv[1]); client=pathlib.Path(sys.argv[2])
+def rewrite(path, name):
+    s=path.read_text()
+    if '[Interface]' not in s or '[Peer]' not in s:
+        raise SystemExit(f'Invalid AWG config: {path}')
+    # Preserve keys, encryption/obfuscation params and all peers.
+    parts=re.split(r'(?m)^\[Peer\]\s*$', s, maxsplit=1)
+    if len(parts)!=2: raise SystemExit('Missing Peer')
+    head, peers = parts
+    head=re.sub(r'(?im)^(?:PostUp|PostDown|PreUp|PreDown|Table|DNS|MTU)\s*=.*(?:\n|$)', '', head)
+    if name=='wg0':
+        inject='PostUp = /config/hub-rules.sh up\nPreDown = /config/hub-rules.sh down\nMTU = 1280\n'
+    else:
+        inject='Table = 55111\nMTU = 1280\n'
+    head=head.replace('[Interface]', '[Interface]\n'+inject, 1)
+    path.write_text(head+'[Peer]'+peers)
+rewrite(server,'wg0'); rewrite(client,'wg1')
+if not re.search(r'(?im)^AllowedIPs\s*=\s*0\.0\.0\.0/0\s*$',client.read_text()):
+    raise SystemExit('Upstream client must have AllowedIPs = 0.0.0.0/0')
+PY
+   # Force the generated client to use a local-only IPv4 tunnel.
+   chmod 600 "$BASE/config/wg_confs/wg0.conf" "$BASE/config/wg_confs/wg1.conf"
+   log 'Starting MSK cascade'
+   docker compose up -d
+   sleep 5
+   docker exec amneziawg ip rule show | grep '55111' || die 'Policy rule not installed; inspect container logs.'
+   docker exec amneziawg ip route show table 55111 | grep 'unreachable default' || die 'Kill-switch fallback route missing.'
+   docker exec amneziawg awg show wg1 >/dev/null || die 'wg1 missing; inspect Docker logs.'
+   touch "$BASE/cascade-installed"
+   log 'Cascade installed. Check handshake and end-to-end IP from a Keenetic client.'
+   status
+   ;;
+ status) status;;
+ help|-h|--help) usage;;
+ *) usage; die "Unknown mode: $mode";;
+esac
