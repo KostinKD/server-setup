@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Keenetic -> AWG (MSK) -> AWG (Sweden), based on AYastrebov/docker-amneziawg.
-# Run on clean Ubuntu 24.04 VPS as root. Does not install router rules.
+# Fresh AWG 3.1 deployment, Ubuntu 24.04/26.04. Keeps prior deployment untouched.
 set -Eeuo pipefail
 umask 077
-BASE=/opt/awg-chain
+BASE=/opt/awg-chain31
 IMAGE=ghcr.io/ayastrebov/docker-amneziawg:latest
+CONTAINER=amneziawg31
 MSK_PORT=51820
 SE_PORT=51821
 MSK_SUBNET=10.70.0.0
@@ -15,18 +16,21 @@ log(){ printf '\n[awg-chain] %s\n' "$*"; }
 die(){ printf '[awg-chain] ERROR: %s\n' "$*" >&2; exit 1; }
 usage(){ cat <<'EOF'
 Usage:
-  sudo bash awg-chain.sh sweden --public-ip SWEDEN_PUBLIC_IP
-  sudo bash awg-chain.sh msk-init --public-ip MSK_PUBLIC_IP
-  sudo bash awg-chain.sh msk-finish --upstream /path/to/peer_msk.conf
-  sudo bash awg-chain.sh status
+  sudo bash chain_setup_3_1.sh sweden --public-ip SWEDEN_PUBLIC_IP
+  sudo bash chain_setup_3_1.sh msk-init --public-ip MSK_PUBLIC_IP
+  sudo bash chain_setup_3_1.sh msk-finish --upstream /path/to/peer_msk.conf
+  sudo bash chain_setup_3_1.sh status
 
-Run sweden FIRST. Copy /opt/awg-chain/config/peer_msk/peer_msk.conf
+Run sweden FIRST. Copy /opt/awg-chain31/config/peer_msk/peer_msk.conf
 securely from Sweden to the Moscow VPS, then run msk-finish there.
-From Moscow, copy /opt/awg-chain/config/peer_keenetic/peer_keenetic.conf
+From Moscow, copy /opt/awg-chain31/config/peer_keenetic/peer_keenetic.conf
 securely to your computer for import into Keenetic.
 
-WARNING: The MSK kill switch works only for forwarded traffic arriving on
-wg0. DNS-based split routing on Keenetic can still fail open if VPN drops.
+WARNING: Fresh parallel installation in /opt/awg-chain31, NOT an in-place
+upgrade. Existing /opt/awg-chain is preserved. Old Docker container must
+be stopped separately to free ports, and peers need new configs.
+The MSK kill switch protects forwarded traffic only; Keenetic domain routes
+may fail open when VPN goes down.
 EOF
 }
 [[ ${EUID} -eq 0 ]] || die 'Run as root using sudo.'
@@ -52,7 +56,7 @@ PY
 require_host(){
  [[ -f /etc/os-release ]] || die 'Requires Ubuntu 24.04.'
  . /etc/os-release
- [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]] || die "Expected Ubuntu 24.04; got ${PRETTY_NAME:-unknown}."
+ [[ "$ID" == ubuntu && ( "$VERSION_ID" == 24.04 || "$VERSION_ID" == 26.04 ) ]] || die "Expected Ubuntu 24.04/26.04; got ${PRETTY_NAME:-unknown}."
  [[ -e /dev/net/tun ]] || die '/dev/net/tun missing; VPS must expose TUN.'
  [[ $(uname -m) == x86_64 || $(uname -m) == aarch64 ]] || die 'Only x86_64/aarch64 supported.'
 }
@@ -80,7 +84,7 @@ write_compose(){
 services:
   amneziawg:
     image: ${IMAGE}
-    container_name: amneziawg
+    container_name: ${CONTAINER}
     cap_add:
       - NET_ADMIN
     devices:
@@ -96,13 +100,20 @@ services:
       - INTERNAL_SUBNET=${subnet}
       - ALLOWEDIPS=0.0.0.0/0
       - IP6_SUBNET=off
-      - AWG_VERSION=2.0
+      - AWG_VERSION=3.1
+      - AWG_RANDOM_TRAILERS=on
+      - AWG_DISABLE_COOKIES=off
+      - AWG_S1=16
+      - AWG_S2=16
+      - AWG_S3=16
+      - AWG_S4=16
+      - AWG_CONTENT_PADDING=0
       - LOG_CONFS=false
       - PERSISTENTKEEPALIVE_PEERS=all
     volumes:
       - ./config:/config
     ports:
-      - '${port}:${port}/udp'
+      - '${port}:51820/udp'
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.src_valid_mark=1
@@ -117,18 +128,45 @@ EOF
 wait_file(){
  local file="$1"
  for _ in $(seq 1 40); do [[ -s "$file" ]] && return 0; sleep 2; done
- docker logs --tail 80 amneziawg || true
+ docker logs --tail 80 "$CONTAINER" || true
  die "Did not generate $file; inspect Docker logs."
+}
+fix_keenetic_i1(){
+ local file="$1"
+ # Keenetic has a 1000-byte limit per random tag in I1.
+ # Splitting <r 1178> preserves identical on-wire bytes.
+ python3 - "$file" <<'PYFIX'
+from pathlib import Path
+import sys, re
+p=Path(sys.argv[1])
+s=p.read_text()
+s=re.sub(r'(<r 1178>)', '<r 1000><r 178>', s)
+p.write_text(s)
+PYFIX
+ chmod 600 "$file"
+}
+check_awg31(){
+ local file="$1"
+ python3 - "$file" <<'PYCHECK'
+from pathlib import Path
+import sys,re
+s=Path(sys.argv[1]).read_text()
+iface=s.split('[Peer]',1)[0]
+assert re.search(r'(?im)^RandomTrailers\s*=\s*on\s*$',iface), 'RandomTrailers missing'
+for i in range(1,5):
+ assert re.search(rf'(?m)^S{i}\s*=\s*16\s*$',iface), f'S{i} mismatch'
+assert re.search(r'(?im)^HeaderProtectionKey\s*=',iface), 'HeaderProtectionKey missing'
+PYCHECK
 }
 status(){
  [[ -f "$BASE/docker-compose.yml" ]] || die "No installation at $BASE"
  cd "$BASE"
  docker compose ps
- docker exec amneziawg awg show || true
+ docker exec "$CONTAINER" awg show || true
  if [[ -f "$BASE/role" && $(cat "$BASE/role") == msk ]]; then
-   docker exec amneziawg ip -4 rule show || true
-   docker exec amneziawg ip -4 route show table "$TABLE" || true
-   docker exec amneziawg iptables -S FORWARD || true
+   docker exec "$CONTAINER" ip -4 rule show || true
+   docker exec "$CONTAINER" ip -4 route show table "$TABLE" || true
+   docker exec "$CONTAINER" iptables -S FORWARD || true
  fi
 }
 case "$mode" in
@@ -137,17 +175,23 @@ case "$mode" in
    command -v python3 >/dev/null || { apt-get update; apt-get install -y python3; }
    validate_ip "$PUBLIC_IP"
    require_host
-   [[ ! -e "$BASE/role" ]] || die "Installation already exists at $BASE; refusing to overwrite keys."
+   [[ ! -e "$BASE/role" && ! -e "$BASE/config/wg_confs/wg0.conf" ]] || die "Installation already exists at $BASE; refusing to overwrite keys."
+   if docker container inspect amneziawg >/dev/null 2>&1; then
+     [[ "$(docker inspect -f '{{.State.Running}}' amneziawg 2>/dev/null)" != true ]] || die 'Old AWG 2.0 container is running. Stop it manually before using same UDP ports; old files will be preserved.'
+   fi
    install_docker
    if [[ "$mode" == sweden ]]; then
      log 'Configuring Sweden exit: UDP 51821'
      write_compose sweden "$PUBLIC_IP" "$SE_PORT" "$SE_SUBNET" msk Europe/Stockholm
      wait_file "$BASE/config/peer_msk/peer_msk.conf"
+   check_awg31 "$BASE/config/peer_msk/peer_msk.conf"
      log "Ready: copy $BASE/config/peer_msk/peer_msk.conf securely to MSK."
    else
      log 'Configuring Moscow entry: UDP 51820'
      write_compose msk "$PUBLIC_IP" "$MSK_PORT" "$MSK_SUBNET" keenetic Europe/Moscow
      wait_file "$BASE/config/peer_keenetic/peer_keenetic.conf"
+   fix_keenetic_i1 "$BASE/config/peer_keenetic/peer_keenetic.conf"
+   check_awg31 "$BASE/config/peer_keenetic/peer_keenetic.conf"
      log "Ready: Keenetic config at $BASE/config/peer_keenetic/peer_keenetic.conf"
      log 'Next: msk-finish --upstream /path/to/peer_msk.conf'
    fi
@@ -159,6 +203,7 @@ case "$mode" in
    [[ ! -e "$BASE/cascade-installed" ]] || die 'Cascade already installed; refusing to overwrite configurations.'
    [[ -f "$BASE/config/wg_confs/wg0.conf" ]] || die 'Generated wg0.conf missing.'
    command -v python3 >/dev/null || die 'python3 required.'
+   check_awg31 "$UPSTREAM"
    log 'Stopping MSK container to modify generated config'
    cd "$BASE"; docker compose down
    mkdir -p "$BASE/backup"
@@ -220,14 +265,16 @@ rewrite(server,'wg0'); rewrite(client,'wg1')
 if not re.search(r'(?im)^AllowedIPs\s*=\s*0\.0\.0\.0/0\s*$',client.read_text()):
     raise SystemExit('Upstream client must have AllowedIPs = 0.0.0.0/0')
 PY
+   # Preserve original peer file; server bridge requires wg1 via Sweden.
+   check_awg31 "$BASE/config/wg_confs/wg1.conf"
    # Force the generated client to use a local-only IPv4 tunnel.
    chmod 600 "$BASE/config/wg_confs/wg0.conf" "$BASE/config/wg_confs/wg1.conf"
    log 'Starting MSK cascade'
    docker compose up -d
    sleep 5
-   docker exec amneziawg ip rule show | grep '55111' || die 'Policy rule not installed; inspect container logs.'
-   docker exec amneziawg ip route show table 55111 | grep 'unreachable default' || die 'Kill-switch fallback route missing.'
-   docker exec amneziawg awg show wg1 >/dev/null || die 'wg1 missing; inspect Docker logs.'
+   docker exec "$CONTAINER" ip rule show | grep '55111' || die 'Policy rule not installed; inspect container logs.'
+   docker exec "$CONTAINER" ip route show table 55111 | grep 'unreachable default' || die 'Kill-switch fallback route missing.'
+   docker exec "$CONTAINER" awg show wg1 >/dev/null || die 'wg1 missing; inspect Docker logs.'
    touch "$BASE/cascade-installed"
    log 'Cascade installed. Check handshake and end-to-end IP from a Keenetic client.'
    status
